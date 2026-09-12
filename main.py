@@ -2,10 +2,11 @@ import os
 import asyncio
 import re
 import logging
+from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-# रेंडर में लॉग्स देखने के लिए
+# लॉग्स देखने के लिए सेटिंग
 logging.basicConfig(level=logging.INFO)
 
 # ==========================================
@@ -105,6 +106,28 @@ async def auto_delete_task(client: Client, chat_id: int, file_msg_id: int, warni
     except Exception as e:
         logging.error(f"Delete एरर: {e}")
 
+
+# ==========================================
+# रेंडर को बेवकूफ बनाने के लिए डमी वेब सर्वर
+# ==========================================
+async def handle(request):
+    return web.Response(text="Bot is running smoothly on Render!")
+
+async def start_web_server():
+    web_app = web.Application()
+    web_app.router.add_get('/', handle)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    
+    # रेंडर का पोर्ट लेना
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Dummy web server started on port {port}")
+
 if __name__ == "__main__":
-    logging.info("🤖 Bot Started on Render!")
+    logging.info("🤖 Starting Bot and Web Server...")
+    # सर्वर स्टार्ट करो
+    app.loop.run_until_complete(start_web_server())
+    # बोट स्टार्ट करो
     app.run()
