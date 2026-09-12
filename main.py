@@ -2,45 +2,73 @@ import os
 import asyncio
 import re
 import logging
+import base64
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-# लॉग्स देखने के लिए सेटिंग
 logging.basicConfig(level=logging.INFO)
 
 # ==========================================
-# रेंडर के Environment Variables से डिटेल्स लेना
+# Environment Variables (For Render)
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID", 0))
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-AUTO_DELETE_TIME = int(os.environ.get("AUTO_DELETE_TIME", 300)) # डिफ़ॉल्ट 5 मिनट
+
+# Get Multiple Admin IDs (कॉमा से अलग की गई IDs को लिस्ट में बदलना)
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+
+AUTO_DELETE_TIME = int(os.environ.get("AUTO_DELETE_TIME", 300)) # Default 5 mins
 
 app = Client("render_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Store draft data
 user_states = {}
 
-# 1. ADMIN: फाइल रिसीव करना
-@app.on_message(filters.private & filters.user(ADMIN_ID) & (filters.document | filters.video | filters.photo | filters.audio))
+# ==========================================
+# 1. ADMIN: Receive File or Album
+# ==========================================
+# यहाँ ADMIN_IDS लिस्ट पास की गई है, जिससे सभी एडमिन्स को एक्सेस मिलेगा
+@app.on_message(filters.private & filters.user(ADMIN_IDS) & (filters.document | filters.video | filters.photo | filters.audio))
 async def handle_media(client: Client, message: Message):
-    try:
-        copied_msg = await message.copy(chat_id=DB_CHANNEL_ID)
-        user_states[message.chat.id] = {"db_msg_id": copied_msg.id, "buttons": []}
+    state = user_states.setdefault(message.chat.id, {'db_ids': [], 'buttons': [], 'processed_groups': set()})
+    
+    if message.media_group_id:
+        if message.media_group_id in state['processed_groups']:
+            return 
         
-        await message.reply_text(
-            "✅ **फाइल डेटाबेस चैनल में सेव हो गई!**\n\n"
-            "क्या तुम इस पोस्ट में **बटन्स** जोड़ना चाहते हो?\n"
-            "ऐसे भेजो: `[बटन का नाम](लिंक)`\n"
-            "*(उदाहरण: `[Google](https://google.com)`)*\n\n"
-            "नहीं जोड़ने हैं, तो सीधा **/done** भेज दो।"
-        )
-    except Exception as e:
-        await message.reply_text(f"❌ चैनल में सेव करने में एरर: {e}")
+        state['processed_groups'].add(message.media_group_id)
+        try:
+            copied_msgs = await client.copy_media_group(DB_CHANNEL_ID, message.chat.id, message.id)
+            state['db_ids'].extend([m.id for m in copied_msgs])
+            await message.reply_text(
+                "✅ **Album saved to database!**\n\n"
+                "Do you want to add buttons?\n"
+                "Format: `[Button Name](Link)`\n\n"
+                "Send **/done** to generate the link."
+            )
+        except Exception as e:
+            await message.reply_text(f"❌ Error saving album: {e}")
+            
+    else:
+        try:
+            copied_msg = await message.copy(chat_id=DB_CHANNEL_ID)
+            state['db_ids'].append(copied_msg.id)
+            await message.reply_text(
+                "✅ **File saved to database!**\n\n"
+                "Do you want to add buttons?\n"
+                "Format: `[Button Name](Link)`\n\n"
+                "Send **/done** to generate the link."
+            )
+        except Exception as e:
+            await message.reply_text(f"❌ Error saving file: {e}")
 
-# 2. ADMIN: बटन्स ऐड करना
-@app.on_message(filters.private & filters.user(ADMIN_ID) & filters.text & ~filters.command(["start", "done"]))
+# ==========================================
+# 2. ADMIN: Add Buttons
+# ==========================================
+@app.on_message(filters.private & filters.user(ADMIN_IDS) & filters.text & ~filters.command(["start", "done"]))
 async def add_buttons(client: Client, message: Message):
     state = user_states.get(message.chat.id)
     if not state:
@@ -49,66 +77,111 @@ async def add_buttons(client: Client, message: Message):
     matches = re.findall(r"\[(.*?)\]\((.*?)\)", message.text)
     if matches:
         for name, url in matches:
+            if not url.startswith("http://") and not url.startswith("https://"):
+                url = "https://" + url
             state["buttons"].append(InlineKeyboardButton(name, url=url))
-        await message.reply_text("✅ बटन जुड़ गया! और जोड़ने हैं तो भेजते रहो, वरना **/done** भेजो।")
+        await message.reply_text("✅ **Button added!**\nSend more or send **/done** to finish.")
     else:
-        await message.reply_text("❌ गलत फॉर्मेट! ऐसे भेजो: `[बटन का नाम](लिंक)`")
+        await message.reply_text("❌ Invalid format! Please send like this: `[Button Name](Link)`")
 
-# 3. ADMIN: लिंक जनरेट करना
-@app.on_message(filters.private & filters.user(ADMIN_ID) & filters.command("done"))
+# ==========================================
+# 3. ADMIN: Generate Link (/done)
+# ==========================================
+@app.on_message(filters.private & filters.user(ADMIN_IDS) & filters.command("done"))
 async def finish_and_get_link(client: Client, message: Message):
     state = user_states.get(message.chat.id)
-    if not state:
-        return await message.reply_text("❌ पहले कोई मीडिया फाइल तो भेजो!")
+    if not state or not state['db_ids']:
+        return await message.reply_text("❌ Please send a media file or album first!")
     
-    db_msg_id = state["db_msg_id"]
-    buttons = state["buttons"]
+    db_ids = state['db_ids']
+    buttons = state['buttons']
     
     try:
         if buttons:
             reply_markup = InlineKeyboardMarkup([[btn] for btn in buttons])
-            await client.edit_message_reply_markup(chat_id=DB_CHANNEL_ID, message_id=db_msg_id, reply_markup=reply_markup)
+            
+            if len(db_ids) == 1:
+                try:
+                    await client.edit_message_reply_markup(chat_id=DB_CHANNEL_ID, message_id=db_ids[0], reply_markup=reply_markup)
+                except:
+                    btn_msg = await client.send_message(DB_CHANNEL_ID, "🔗 **Links:**", reply_markup=reply_markup)
+                    db_ids.append(btn_msg.id)
+            else:
+                btn_msg = await client.send_message(DB_CHANNEL_ID, "🔗 **Links:**", reply_markup=reply_markup)
+                db_ids.append(btn_msg.id)
+        
+        ids_str = "-".join(map(str, db_ids))
+        payload = base64.urlsafe_b64encode(ids_str.encode()).decode().rstrip('=')
         
         bot_info = await client.get_me()
-        link = f"https://t.me/{bot_info.username}?start={db_msg_id}"
+        link = f"https://t.me/{bot_info.username}?start={payload}"
         
         await message.reply_text(
-            f"🎉 **लो भाई, तुम्हारा शेयरिंग लिंक तैयार है!**\n\n"
+            f"🎉 **Your sharing link is ready!**\n\n"
             f"🔗 `{link}`\n\n"
-            f"⏳ यह फाइल यूजर्स को {AUTO_DELETE_TIME // 60} मिनट बाद ऑटो-डिलीट हो जाएगी।",
+            f"⏳ *Note: Files will be auto-deleted for users after {AUTO_DELETE_TIME // 60} minutes silently.*",
             disable_web_page_preview=True
         )
         del user_states[message.chat.id]
     except Exception as e:
-        await message.reply_text(f"❌ लिंक बनाने में दिक्कत आ गई: {e}")
+        await message.reply_text(f"❌ Error generating link: {e}")
 
-# 4. USER: फाइल सेंड करना और ऑटो-डिलीट
+# ==========================================
+# 4. USER: Receive File (Silent Auto-Delete)
+# ==========================================
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
     if len(message.command) > 1:
+        payload = message.command[1]
         try:
-            msg_id = int(message.command[1])
-            sent_msg = await client.copy_message(chat_id=message.chat.id, from_chat_id=DB_CHANNEL_ID, message_id=msg_id)
-            warning_msg = await message.reply_text(f"⚠️ **ध्यान दें:** यह मैसेज {AUTO_DELETE_TIME // 60} मिनट बाद अपने आप डिलीट हो जाएगा!")
+            padding = 4 - (len(payload) % 4)
+            if padding != 4:
+                payload += "=" * padding
+            ids_str = base64.urlsafe_b64decode(payload).decode()
+            db_ids = [int(x) for x in ids_str.split('-')]
+        except:
+            return await message.reply_text("❌ Invalid or expired link!")
+        
+        try:
+            messages = await client.get_messages(DB_CHANNEL_ID, db_ids)
+            sent_msg_ids = []
+            processed_groups = set()
             
-            asyncio.create_task(auto_delete_task(client, message.chat.id, sent_msg.id, warning_msg.id))
+            for msg in messages:
+                if msg.empty: continue
+                
+                if msg.media_group_id:
+                    if msg.media_group_id not in processed_groups:
+                        processed_groups.add(msg.media_group_id)
+                        sent_msgs = await client.copy_media_group(message.chat.id, DB_CHANNEL_ID, msg.id)
+                        sent_msg_ids.extend([m.id for m in sent_msgs])
+                else:
+                    sent_msg = await client.copy_message(message.chat.id, DB_CHANNEL_ID, msg.id)
+                    sent_msg_ids.append(sent_msg.id)
+            
+            if sent_msg_ids:
+                asyncio.create_task(auto_delete_task(client, message.chat.id, sent_msg_ids))
+            else:
+                await message.reply_text("❌ File not found or link expired.")
+                
         except Exception as e:
             logging.error(f"Error fetching file: {e}")
-            await message.reply_text("❌ फाइल नहीं मिली या लिंक एक्सपायर हो गया है।")
+            await message.reply_text("❌ Error fetching file.")
     else:
-        await message.reply_text("👋 नमस्ते! मैं एक फाइल शेयरिंग बोट हूँ।\nमुझसे फाइल लेने के लिए मेरे दिए गए लिंक पर क्लिक करें।")
-
-# 5. ऑटो-डिलीट टाइमर
-async def auto_delete_task(client: Client, chat_id: int, file_msg_id: int, warning_msg_id: int):
-    await asyncio.sleep(AUTO_DELETE_TIME)
-    try:
-        await client.delete_messages(chat_id=chat_id, message_ids=[file_msg_id, warning_msg_id])
-    except Exception as e:
-        logging.error(f"Delete एरर: {e}")
-
+        await message.reply_text("👋 Hello! I am a File Sharing Bot.\nPlease click a valid link to get your files.")
 
 # ==========================================
-# रेंडर को बेवकूफ बनाने के लिए डमी वेब सर्वर
+# 5. Background Task: Auto-Delete
+# ==========================================
+async def auto_delete_task(client: Client, chat_id: int, message_ids: list):
+    await asyncio.sleep(AUTO_DELETE_TIME)
+    try:
+        await client.delete_messages(chat_id=chat_id, message_ids=message_ids)
+    except Exception as e:
+        logging.error(f"Delete Error: {e}")
+
+# ==========================================
+# Web Server (Required to keep Render active)
 # ==========================================
 async def handle(request):
     return web.Response(text="Bot is running smoothly on Render!")
@@ -119,15 +192,12 @@ async def start_web_server():
     runner = web.AppRunner(web_app)
     await runner.setup()
     
-    # रेंडर का पोर्ट लेना
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logging.info(f"Dummy web server started on port {port}")
+    logging.info(f"Web server started on port {port}")
 
 if __name__ == "__main__":
     logging.info("🤖 Starting Bot and Web Server...")
-    # सर्वर स्टार्ट करो
     app.loop.run_until_complete(start_web_server())
-    # बोट स्टार्ट करो
     app.run()
