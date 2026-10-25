@@ -1,14 +1,115 @@
+#!/usr/bin/env python3
+"""
+Telegram File Link Bot (single file)
+
+पहली बार चलाने के लिए:   python3 bot.py
+हमेशा चालू रखने के लिए:  python3 bot.py --service
+"""
 import os
+import sys
+import subprocess
+import getpass
+
+# ============================================================
+# BOOTSTRAP: venv बनाना, लाइब्रेरी इंस्टॉल करना, .env सेटअप
+# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VENV_DIR = os.path.join(BASE_DIR, "venv")
+VENV_PY = os.path.join(VENV_DIR, "bin", "python")
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+SERVICE_NAME = "telegram-bot"
+REQUIREMENT = "python-telegram-bot[job-queue]>=21.0,<22.0"
+
+
+def bootstrap():
+    """अगर venv में नहीं हैं तो venv बनाकर उसी में इस फ़ाइल को दोबारा चलाता है।"""
+    if sys.prefix != sys.base_prefix:  # पहले से venv में हैं
+        return
+    if not os.path.isdir(VENV_DIR):
+        print(">>> Virtual environment बन रहा है...")
+        subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
+    print(">>> लाइब्रेरी चेक/इंस्टॉल हो रही हैं...")
+    subprocess.check_call([VENV_PY, "-m", "pip", "install", "-q", REQUIREMENT])
+    os.execv(VENV_PY, [VENV_PY] + sys.argv)
+
+
+def load_env():
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, val = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), val.strip())
+
+
+def ask_setup_if_missing():
+    if os.environ.get("BOT_TOKEN"):
+        return
+    if not sys.stdin.isatty():
+        raise SystemExit("BOT_TOKEN नहीं मिला। .env फ़ाइल चेक करो।")
+    print("\n=== पहली बार सेटअप ===")
+    token = getpass.getpass("BOT_TOKEN paste करो (स्क्रीन पर नहीं दिखेगा): ").strip()
+    admin = input("ADMIN_IDS (तुम्हारी Telegram ID, कई हों तो comma से): ").strip()
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.write(
+            f"BOT_TOKEN={token}\n"
+            f"ADMIN_IDS={admin}\n"
+            f"DB_PATH={os.path.join(BASE_DIR, 'bot.db')}\n"
+        )
+    os.chmod(ENV_FILE, 0o600)
+    load_env()
+    print(">>> .env सेव हो गई।\n")
+
+
+def install_service():
+    """systemd सर्विस बनाता है: बोट हमेशा चलेगा, क्रैश या रीबूट पर खुद उठेगा।"""
+    ask_setup_if_missing()
+    run_user = os.environ.get("SUDO_USER") or getpass.getuser()
+    unit = f"""[Unit]
+Description=Telegram File Link Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={run_user}
+WorkingDirectory={BASE_DIR}
+EnvironmentFile={ENV_FILE}
+ExecStart={VENV_PY} {os.path.abspath(__file__)}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+    print(">>> systemd सर्विस लिखी जा रही है (sudo पासवर्ड पूछ सकता है)...")
+    subprocess.run(
+        ["sudo", "tee", f"/etc/systemd/system/{SERVICE_NAME}.service"],
+        input=unit, text=True, stdout=subprocess.DEVNULL, check=True,
+    )
+    for args in (["daemon-reload"], ["enable", SERVICE_NAME], ["restart", SERVICE_NAME]):
+        subprocess.run(["sudo", "systemctl", *args], check=True)
+    print(f"\n✅ बोट सर्विस के रूप में चल रहा है।")
+    print(f"Live logs: sudo journalctl -u {SERVICE_NAME} -f")
+    print(f"Status:    sudo systemctl status {SERVICE_NAME}")
+
+
+bootstrap()
+load_env()
+if "--service" in sys.argv:
+    install_service()
+    sys.exit(0)
+ask_setup_if_missing()
+
+# ============================================================
+# BOT (नीचे का हिस्सा पूरी तरह इंग्लिश UI के साथ)
+# ============================================================
 import json
-import time
 import secrets
 import sqlite3
 import asyncio
 import logging
-import threading
-import urllib.request
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import (
     Update,
@@ -29,22 +130,14 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ============================================================
-# CONFIG (set these as environment variables on Render)
-# ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip().isdigit()}
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-PORT = int(os.getenv("PORT", "10000"))             # Render sets this automatically
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # Render sets this automatically
+DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "bot.db"))
 DEFAULT_DELETE_MIN = 5
-MAX_ALBUM = 10                                     # Telegram limit per album
+MAX_ALBUM = 10
 
 MEDIA_TYPES = {
     "photo": InputMediaPhoto,
@@ -59,47 +152,6 @@ BUTTON_HELP = (
     "Label1 | https://a && Label2 | https://b\n\n"
     "Or press Skip."
 )
-
-# ============================================================
-# KEEP-ALIVE (stops Render from sleeping the service)
-# ============================================================
-class PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, *args):
-        return  # keep logs clean
-
-
-def start_web_server():
-    server = HTTPServer(("0.0.0.0", PORT), PingHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Keep-alive server running on port %s", PORT)
-
-
-def start_self_ping():
-    if not RENDER_URL:
-        log.info("RENDER_EXTERNAL_URL not set, self-ping disabled")
-        return
-
-    def loop():
-        while True:
-            time.sleep(4 * 60)
-            try:
-                urllib.request.urlopen(RENDER_URL, timeout=20).read()
-            except Exception as e:
-                log.warning("Self-ping failed: %s", e)
-
-    threading.Thread(target=loop, daemon=True).start()
-    log.info("Self-ping enabled for %s", RENDER_URL)
-
 
 # ============================================================
 # DATABASE
@@ -143,6 +195,10 @@ def run(sql, *args):
     return cur
 
 
+def count(sql, *args):
+    return run(sql, *args).fetchone()[0]
+
+
 def get_setting(key):
     return run("SELECT value FROM settings WHERE key=?", key).fetchone()["value"]
 
@@ -168,7 +224,7 @@ def save_user(user):
 
 
 def create_link(text, buttons, items):
-    code = secrets.token_urlsafe(9)  # safe for Telegram deep links
+    code = secrets.token_urlsafe(9)
     run(
         "INSERT INTO links (code, text, buttons, items, created_at, opens) VALUES (?, ?, ?, ?, ?, 0)",
         code, text, json.dumps(buttons), json.dumps(items), now_iso(),
@@ -226,7 +282,7 @@ async def send_single(bot, chat_id, item, protect):
 
 
 # ============================================================
-# AUTO-DELETE (survives restarts, because it is stored in the DB)
+# AUTO-DELETE (DB में सेव, इसलिए रीस्टार्ट के बाद भी चलता है)
 # ============================================================
 async def delete_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
@@ -258,15 +314,15 @@ def schedule_deletion(app, chat_id, message_ids, seconds):
 
 async def restore_pending_deletes(app):
     now = datetime.now()
-    for row in run("SELECT * FROM pending_deletes").fetchall():
+    rows = run("SELECT * FROM pending_deletes").fetchall()
+    for row in rows:
         due = datetime.fromisoformat(row["delete_at"])
         seconds = (due - now).total_seconds()
         queue_delete(app, row["id"], row["chat_id"], json.loads(row["message_ids"]), seconds)
-    log.info("Restored %d pending deletions", len(run("SELECT id FROM pending_deletes").fetchall()))
+    log.info("Restored %d pending deletions", len(rows))
 
 
 async def send_content(context, chat_id, link, auto_delete=True):
-    """Sends album(s) + text + buttons. auto_delete=True removes everything after the set time."""
     protect = get_setting("protect") == "1"
     items = link["items"]
     message_ids = []
@@ -284,7 +340,7 @@ async def send_content(context, chat_id, link, auto_delete=True):
                 message_ids += [m.message_id for m in msgs]
                 sent_as_album = True
             except BadRequest:
-                sent_as_album = False  # mixed types Telegram rejects, send one by one
+                sent_as_album = False
         if not sent_as_album:
             for x in chunk:
                 m = await send_single(context.bot, chat_id, x, protect)
@@ -308,7 +364,7 @@ async def send_content(context, chat_id, link, auto_delete=True):
 
 
 # ============================================================
-# KEYBOARDS AND SCREENS
+# SCREENS AND KEYBOARDS
 # ============================================================
 def admin_menu_kb():
     return Kb([
@@ -358,10 +414,6 @@ async def show_stats(context, chat_id):
     await say(context, chat_id, text, Kb([[Btn("🏠 Menu", callback_data="menu")]]))
 
 
-def count(sql, *args):
-    return run(sql, *args).fetchone()[0]
-
-
 async def show_settings(context, chat_id):
     minutes = get_setting("delete_min")
     protect_on = get_setting("protect") == "1"
@@ -398,7 +450,6 @@ async def finish_builder(context, chat_id):
         ud.clear()
         return await say(context, chat_id, f"🔗 Your link is ready:\n{url}", admin_menu_kb())
 
-    # Broadcast: show preview first, then ask for confirmation
     ud["state"] = "confirm"
     ud["bc"] = link
     await send_content(context, chat_id, link, auto_delete=False)
@@ -427,7 +478,7 @@ async def run_broadcast(context, admin_chat, bc):
             fail += 1
         except TelegramError:
             fail += 1
-        await asyncio.sleep(0.05)  # avoid Telegram rate limits
+        await asyncio.sleep(0.05)
     await say(
         context, admin_chat,
         f"📢 Broadcast finished\n✅ Delivered: {ok}\n❌ Failed: {fail}",
@@ -443,7 +494,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     save_user(user)
 
-    if context.args:  # opened via a link
+    if context.args:
         code = context.args[0]
         row = run("SELECT * FROM links WHERE code=?", code).fetchone()
         if not row:
@@ -629,10 +680,6 @@ async def post_init(app: Application):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set.")
-
-    start_web_server()
-    start_self_ping()
-
     app = (
         Application.builder()
         .token(BOT_TOKEN)
