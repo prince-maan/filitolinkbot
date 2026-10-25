@@ -1,196 +1,501 @@
 import os
+import json
+import secrets
+import sqlite3
 import asyncio
-import re
 import logging
-import base64
-from aiohttp import web
-from pyrogram import Client, filters, idle
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime
+
+from telegram import (
+    Update, InlineKeyboardButton as B, InlineKeyboardMarkup as KM,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
+)
+from telegram.error import Forbidden, BadRequest, RetryAfter, TelegramError
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters,
+)
 
 logging.basicConfig(level=logging.INFO)
 
-# ==========================================
-# Environment Variables (For Render)
-# ==========================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH")
-DB_CHANNEL_ID = int(os.environ.get("DB_CHANNEL_ID", 0))
+# ================= CONFIG =================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "123456789").split(",")}
+DB_PATH = "bot.db"
+DEFAULT_DELETE_MIN = 5
 
-# Get Multiple Admin IDs (कॉमा से अलग की गई IDs)
-ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-AUTO_DELETE_TIME = int(os.environ.get("AUTO_DELETE_TIME", 300)) # Default 5 mins
+MEDIA = {
+    "photo": InputMediaPhoto,
+    "video": InputMediaVideo,
+    "document": InputMediaDocument,
+    "audio": InputMediaAudio,
+}
 
-app = Client("render_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-user_states = {}
+BUTTON_HELP = (
+    "🔘 बटन ऐसे लिखें (हर लाइन एक रो बनेगी, एक ही रो में कई बटन के लिए && लगाएं):\n"
+    "लेबल | https://link\n"
+    "लेबल1 | https://a && लेबल2 | https://b\n\n"
+    "या ⏭ छोड़ो दबाएं।"
+)
 
-# ==========================================
-# 1. ADMIN: Receive File or Album
-# ==========================================
-@app.on_message(filters.private & filters.user(ADMIN_IDS) & (filters.document | filters.video | filters.photo | filters.audio))
-async def handle_media(client: Client, message: Message):
-    state = user_states.setdefault(message.chat.id, {'db_ids': [], 'buttons': [], 'processed_groups': set()})
-    
-    if message.media_group_id:
-        if message.media_group_id in state['processed_groups']:
-            return 
-        state['processed_groups'].add(message.media_group_id)
+# ================= DATABASE =================
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    started_at TEXT,
+    blocked INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS links (
+    code TEXT PRIMARY KEY,
+    text TEXT,
+    buttons TEXT,
+    items TEXT,
+    created_at TEXT,
+    opens INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+""")
+db.execute("INSERT OR IGNORE INTO settings VALUES ('delete_min', ?)", (str(DEFAULT_DELETE_MIN),))
+db.execute("INSERT OR IGNORE INTO settings VALUES ('protect', '1')")
+db.commit()
+
+
+def run(sql, *args):
+    cur = db.execute(sql, args)
+    db.commit()
+    return cur
+
+
+def get_setting(key):
+    return run("SELECT value FROM settings WHERE key=?", key).fetchone()["value"]
+
+
+def set_setting(key, value):
+    run("INSERT OR REPLACE INTO settings VALUES (?, ?)", key, str(value))
+
+
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
+
+def save_user(u):
+    run(
+        "INSERT INTO users (user_id, name, started_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, blocked=0",
+        u.id, u.first_name or "", datetime.now().isoformat(timespec="seconds"),
+    )
+
+
+def create_link(text, buttons, items):
+    code = secrets.token_urlsafe(9)  # Telegram deep link ke liye safe characters
+    run(
+        "INSERT INTO links VALUES (?, ?, ?, ?, ?, 0)",
+        code, text, json.dumps(buttons), json.dumps(items),
+        datetime.now().isoformat(timespec="seconds"),
+    )
+    return code
+
+
+# ================= HELPERS =================
+def extract_item(m):
+    if m.photo:
+        return {"t": "photo", "id": m.photo[-1].file_id}
+    if m.video:
+        return {"t": "video", "id": m.video.file_id}
+    if m.document:
+        return {"t": "document", "id": m.document.file_id}
+    if m.audio:
+        return {"t": "audio", "id": m.audio.file_id}
+    return None
+
+
+def parse_buttons(text):
+    rows = []
+    for line in text.splitlines():
+        row = []
+        for part in line.split("&&"):
+            if "|" not in part:
+                continue
+            label, url = [x.strip() for x in part.split("|", 1)]
+            if label and url.startswith(("http://", "https://", "tg://")):
+                row.append({"text": label, "url": url})
+        if row:
+            rows.append(row)
+    return rows
+
+
+def build_kb(rows):
+    if not rows:
+        return None
+    return KM([[B(b["text"], url=b["url"]) for b in row] for row in rows])
+
+
+async def say(context, chat_id, text, kb=None):
+    return await context.bot.send_message(chat_id, text, reply_markup=kb)
+
+
+async def deep_link(context, code):
+    return f"https://t.me/{context.bot_data['username']}?start={code}"
+
+
+async def send_single(bot, chat_id, item, protect):
+    fn = {
+        "photo": bot.send_photo,
+        "video": bot.send_video,
+        "document": bot.send_document,
+        "audio": bot.send_audio,
+    }[item["t"]]
+    return await fn(chat_id, item["id"], protect_content=protect)
+
+
+async def delete_job(context: ContextTypes.DEFAULT_TYPE):
+    d = context.job.data
+    for mid in d["ids"]:
         try:
-            copied_msgs = await client.copy_media_group(DB_CHANNEL_ID, message.chat.id, message.id)
-            state['db_ids'].extend([m.id for m in copied_msgs])
-            await message.reply_text("✅ **Album saved!**\nDo you want to add buttons?\nFormat: `[Name](Link)`\nSend **/done** to finish.")
-        except Exception as e:
-            await message.reply_text(f"❌ Error saving album: {e}")
+            await context.bot.delete_message(d["chat"], mid)
+        except TelegramError:
+            pass
+
+
+async def send_content(context, chat_id, link, schedule=True):
+    """Album + text + buttons bhejta hai. schedule=True par auto-delete lagta hai."""
+    protect = get_setting("protect") == "1"
+    mins = int(get_setting("delete_min"))
+    items = link["items"]
+    ids = []
+
+    for i in range(0, len(items), 10):  # Telegram ek album me max 10
+        chunk = items[i:i + 10]
+        if len(chunk) >= 2:
+            try:
+                msgs = await context.bot.send_media_group(
+                    chat_id,
+                    [MEDIA[x["t"]](x["id"]) for x in chunk],
+                    protect_content=protect,
+                )
+                ids += [m.message_id for m in msgs]
+                continue
+            except BadRequest:
+                pass  # mixed types ho to alag-alag bhejo
+        for x in chunk:
+            m = await send_single(context.bot, chat_id, x, protect)
+            ids.append(m.message_id)
+
+    note = f"\n\n⏳ यह {mins} मिनट बाद अपने-आप डिलीट हो जाएगा।" if schedule else ""
+    body = (link.get("text") or "📎 नीचे दी गई फाइल(एँ) देखें") + note
+    m = await context.bot.send_message(
+        chat_id, body,
+        reply_markup=build_kb(link.get("buttons") or []),
+        protect_content=protect,
+    )
+    ids.append(m.message_id)
+
+    if schedule:
+        context.application.job_queue.run_once(
+            delete_job, when=mins * 60,
+            data={"chat": chat_id, "ids": ids},
+            name=f"del_{chat_id}_{ids[0]}",
+        )
+
+
+# ================= KEYBOARDS =================
+def admin_kb():
+    return KM([
+        [B("📦 एल्बम / मीडिया लिंक", callback_data="new_album")],
+        [B("📄 सिंगल फाइल → लिंक", callback_data="new_single")],
+        [B("📚 बैच लिंक (कई एक साथ)", callback_data="new_batch")],
+        [B("📢 ब्रॉडकास्ट", callback_data="broadcast")],
+        [B("📊 स्टैट्स", callback_data="stats"), B("⚙️ सेटिंग्स", callback_data="settings")],
+    ])
+
+
+def builder_kb(stage):
+    if stage == "collect":
+        rows = [[B("➡️ आगे (टेक्स्ट/बटन)", callback_data="bld_next")]]
+    elif stage == "text":
+        rows = [[B("⏭ टेक्स्ट छोड़ो", callback_data="bld_skip_text")]]
     else:
+        rows = [[B("⏭ बटन छोड़ो → बनाओ", callback_data="bld_finish")]]
+    rows.append([B("❌ रद्द", callback_data="menu")])
+    return KM(rows)
+
+
+async def show_menu(context, chat):
+    await say(context, chat, "🏠 मेन मेनू, नीचे से चुनें:", admin_kb())
+
+
+async def show_stats(context, chat):
+    def one(sql, *a):
+        return run(sql, *a).fetchone()[0]
+
+    total = one("SELECT COUNT(*) FROM users")
+    blocked = one("SELECT COUNT(*) FROM users WHERE blocked=1")
+    today = one("SELECT COUNT(*) FROM users WHERE started_at >= ?",
+                datetime.now().strftime("%Y-%m-%d"))
+    links = one("SELECT COUNT(*) FROM links")
+    opens = one("SELECT COALESCE(SUM(opens), 0) FROM links")
+    text = (
+        "📊 स्टैट्स\n\n"
+        f"👥 कुल जिन्होंने बोट स्टार्ट किया: {total}\n"
+        f"✅ एक्टिव: {total - blocked}\n"
+        f"🚫 बोट ब्लॉक/डिलीट किया: {blocked}\n"
+        f"🆕 आज स्टार्ट किया: {today}\n"
+        f"🔗 कुल लिंक: {links}\n"
+        f"👀 कुल लिंक खुले: {opens}\n\n"
+        "ℹ️ ब्लॉक की गिनती सिर्फ ब्रॉडकास्ट के समय पता चलती है।"
+    )
+    await say(context, chat, text, KM([[B("🏠 मेनू", callback_data="menu")]]))
+
+
+async def show_settings(context, chat):
+    mins = get_setting("delete_min")
+    prot = get_setting("protect") == "1"
+    text = (
+        "⚙️ सेटिंग्स\n\n"
+        f"⏳ ऑटो-डिलीट: {mins} मिनट\n"
+        f"🔒 कंटेंट प्रोटेक्शन: {'ON' if prot else 'OFF'}"
+    )
+    kb = KM([
+        [B(f"{m} मिनट", callback_data=f"set_min:{m}") for m in (1, 3, 5)],
+        [B(f"{m} मिनट", callback_data=f"set_min:{m}") for m in (6, 10, 15)],
+        [B("✏️ कस्टम मिनट", callback_data="custom_min")],
+        [B(f"🔒 प्रोटेक्शन {'OFF करो' if prot else 'ON करो'}", callback_data="toggle_protect")],
+        [B("🏠 मेनू", callback_data="menu")],
+    ])
+    await say(context, chat, text, kb)
+
+
+async def finish_builder(context, chat):
+    ud = context.user_data
+    link = {
+        "text": ud.get("text", ""),
+        "buttons": ud.get("buttons", []),
+        "items": ud.get("items", []),
+    }
+    if not link["items"] and not link["text"]:
+        return await say(context, chat, "❌ कुछ भी नहीं है। पहले फाइल या टेक्स्ट भेजो।", builder_kb("collect"))
+
+    if ud.get("mode") == "album":
+        code = create_link(link["text"], link["buttons"], link["items"])
+        url = await deep_link(context, code)
+        ud.clear()
+        return await say(context, chat, f"🔗 लिंक तैयार है:\n{url}", admin_kb())
+
+    # broadcast: pehle preview, phir confirm
+    ud["state"] = "confirm"
+    ud["bc"] = link
+    await send_content(context, chat, link, schedule=False)
+    await say(
+        context, chat, "👆 यह प्रीव्यू है। सभी यूज़र्स को भेजना है?",
+        KM([[B("🚀 सभी को भेजो", callback_data="bc_send")],
+            [B("❌ रद्द", callback_data="menu")]]),
+    )
+
+
+async def run_broadcast(context, admin_chat, bc):
+    users = run("SELECT user_id FROM users WHERE blocked=0").fetchall()
+    ok = fail = 0
+    for u in users:
         try:
-            copied_msg = await message.copy(chat_id=DB_CHANNEL_ID)
-            state['db_ids'].append(copied_msg.id)
-            await message.reply_text("✅ **File saved!**\nDo you want to add buttons?\nFormat: `[Name](Link)`\nSend **/done** to finish.")
-        except Exception as e:
-            await message.reply_text(f"❌ Error saving file: {e}")
+            await send_content(context, u["user_id"], bc, schedule=False)
+            ok += 1
+        except Forbidden:
+            run("UPDATE users SET blocked=1 WHERE user_id=?", u["user_id"])
+            fail += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            fail += 1
+        except TelegramError:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await say(context, admin_chat,
+              f"📢 ब्रॉडकास्ट खत्म\n✅ पहुंचा: {ok}\n❌ नहीं पहुंचा: {fail}", admin_kb())
 
-# ==========================================
-# 2. ADMIN: Add Buttons
-# ==========================================
-@app.on_message(filters.private & filters.user(ADMIN_IDS) & filters.text & ~filters.command(["start", "done"]))
-async def add_buttons(client: Client, message: Message):
-    state = user_states.get(message.chat.id)
-    if not state:
-        return 
-    
-    matches = re.findall(r"\[(.*?)\]\((.*?)\)", message.text)
-    if matches:
-        for name, url in matches:
-            if not url.startswith("http://") and not url.startswith("https://"):
-                url = "https://" + url
-            state["buttons"].append(InlineKeyboardButton(name, url=url))
-        await message.reply_text("✅ **Button added!**\nSend more or send **/done**.")
-    else:
-        await message.reply_text("❌ Invalid format! Example: `[Google](https://google.com)`")
 
-# ==========================================
-# 3. ADMIN: Generate Link (/done)
-# ==========================================
-@app.on_message(filters.private & filters.user(ADMIN_IDS) & filters.command("done"))
-async def finish_and_get_link(client: Client, message: Message):
-    state = user_states.get(message.chat.id)
-    if not state or not state['db_ids']:
-        return await message.reply_text("❌ Please send a media file or album first!")
-    
-    db_ids = state['db_ids']
-    buttons = state['buttons']
-    
-    try:
-        if buttons:
-            reply_markup = InlineKeyboardMarkup([[btn] for btn in buttons])
-            if len(db_ids) == 1:
-                try:
-                    await client.edit_message_reply_markup(chat_id=DB_CHANNEL_ID, message_id=db_ids[0], reply_markup=reply_markup)
-                except:
-                    btn_msg = await client.send_message(DB_CHANNEL_ID, "🔗 **Links:**", reply_markup=reply_markup)
-                    db_ids.append(btn_msg.id)
-            else:
-                btn_msg = await client.send_message(DB_CHANNEL_ID, "🔗 **Links:**", reply_markup=reply_markup)
-                db_ids.append(btn_msg.id)
-        
-        ids_str = "-".join(map(str, db_ids))
-        payload = base64.urlsafe_b64encode(ids_str.encode()).decode().rstrip('=')
-        
-        bot_info = await client.get_me()
-        link = f"https://t.me/{bot_info.username}?start={payload}"
-        
-        await message.reply_text(f"🎉 **Link ready:**\n\n🔗 `{link}`", disable_web_page_preview=True)
-        del user_states[message.chat.id]
-    except Exception as e:
-        await message.reply_text(f"❌ Error generating link: {e}")
+# ================= HANDLERS =================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    chat = update.effective_chat.id
+    save_user(u)
 
-# ==========================================
-# 4. USER: Receive File (Silent Auto-Delete)
-# ==========================================
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(client: Client, message: Message):
-    if len(message.command) > 1:
-        payload = message.command[1]
+    if context.args:  # link se aaya hai
+        row = run("SELECT * FROM links WHERE code=?", context.args[0]).fetchone()
+        if not row:
+            return await say(context, chat, "❌ यह लिंक गलत है या हटा दिया गया है।")
+        run("UPDATE links SET opens=opens+1 WHERE code=?", context.args[0])
+        link = {
+            "text": row["text"],
+            "buttons": json.loads(row["buttons"]),
+            "items": json.loads(row["items"]),
+        }
         try:
-            padding = 4 - (len(payload) % 4)
-            if padding != 4:
-                payload += "=" * padding
-            ids_str = base64.urlsafe_b64decode(payload).decode()
-            db_ids = [int(x) for x in ids_str.split('-')]
-        except:
-            return await message.reply_text("❌ Invalid or expired link!")
-        
-        try:
-            messages = await client.get_messages(DB_CHANNEL_ID, db_ids)
-            sent_msg_ids = []
-            processed_groups = set()
-            
-            for msg in messages:
-                if msg.empty: continue
-                if msg.media_group_id:
-                    if msg.media_group_id not in processed_groups:
-                        processed_groups.add(msg.media_group_id)
-                        sent_msgs = await client.copy_media_group(message.chat.id, DB_CHANNEL_ID, msg.id)
-                        sent_msg_ids.extend([m.id for m in sent_msgs])
-                else:
-                    sent_msg = await client.copy_message(message.chat.id, DB_CHANNEL_ID, msg.id)
-                    sent_msg_ids.append(sent_msg.id)
-            
-            if sent_msg_ids:
-                asyncio.create_task(auto_delete_task(client, message.chat.id, sent_msg_ids))
-            else:
-                await message.reply_text("❌ File not found.")
-        except Exception as e:
-            logging.error(f"Error fetching file: {e}")
-    else:
-        await message.reply_text("👋 Hello! Click a valid link to get files.")
+            await send_content(context, chat, link)
+        except TelegramError:
+            await say(context, chat, "⚠️ कुछ गड़बड़ हुई, थोड़ी देर बाद फिर कोशिश करें।")
+        return
 
-# ==========================================
-# 5. Background Task: Auto-Delete
-# ==========================================
-async def auto_delete_task(client: Client, chat_id: int, message_ids: list):
-    await asyncio.sleep(AUTO_DELETE_TIME)
-    try:
-        await client.delete_messages(chat_id=chat_id, message_ids=message_ids)
-    except Exception as e:
-        logging.error(f"Delete Error: {e}")
+    if is_admin(u.id):
+        return await show_menu(context, chat)
+    await say(context, chat, "👋 नमस्ते! यह बोट लिंक से फाइल/एल्बम खोलने के लिए है।")
 
-# ==========================================
-# Web Server & STABLE Main Loop 
-# ==========================================
-async def handle(request):
-    return web.Response(text="Bot is running smoothly on Render!")
 
-async def main():
-    # 1. वेब सर्वर स्टार्ट (रेंडर के लिए)
-    web_app = web.Application()
-    web_app.router.add_get('/', handle)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"✅ Web server started on port {port}")
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(cq.from_user.id):
+        return
 
-    # 2. बोट स्टार्ट
-    await app.start()
-    logging.info("✅ Bot Started")
+    chat = cq.message.chat_id
+    d = cq.data
+    ud = context.user_data
 
-    # 3. चैनल को कैशे (Cache) करना
-    try:
-        chat = await app.get_chat(DB_CHANNEL_ID)
-        logging.info(f"✅ Channel Cached Successfully: {chat.title}")
-    except Exception as e:
-        logging.error(f"❌ Failed to cache channel: {e}")
+    if d == "menu":
+        ud.clear()
+        return await show_menu(context, chat)
 
-    # 4. बोट को परमानेंट चालू रखना (यहीं पर पिछली बार क्रैश हुआ था)
-    logging.info("🤖 Bot is now completely LIVE and waiting for messages...")
-    await idle() 
+    if d in ("new_album", "broadcast"):
+        ud.clear()
+        ud.update(state="collect", mode="album" if d == "new_album" else "broadcast",
+                  items=[], text="", buttons=[])
+        return await say(context, chat,
+                         "📤 फोटो/वीडियो/फाइलें भेजें (एक-एक करके या एल्बम की तरह)। फिर ➡️ आगे दबाएं।",
+                         builder_kb("collect"))
 
-    # 5. अगर कोई बोट को बंद करे, तो सफाई से बंद होना
-    await app.stop()
-    await runner.cleanup()
+    if d == "new_single":
+        ud.clear()
+        ud["state"] = "single"
+        return await say(context, chat, "📄 फाइल भेजो, मैं तुरंत लिंक बना दूंगा।",
+                         KM([[B("🏠 मेनू", callback_data="menu")]]))
+
+    if d == "new_batch":
+        ud.clear()
+        ud["state"] = "batch"
+        return await say(context, chat,
+                         "📚 बैच मोड ON: फाइलें एक-एक करके भेजते जाओ, हर फाइल का अलग लिंक बनेगा। खत्म होने पर ✅ दबाओ।",
+                         KM([[B("✅ बैच खत्म", callback_data="menu")]]))
+
+    if d == "bld_next":
+        ud["state"] = "text"
+        return await say(context, chat, "✍️ टेक्स्ट भेजो (लिंक खोलने पर फाइलों के नीचे दिखेगा)।",
+                         builder_kb("text"))
+
+    if d == "bld_skip_text":
+        ud["state"] = "buttons"
+        return await say(context, chat, BUTTON_HELP, builder_kb("buttons"))
+
+    if d == "bld_finish":
+        return await finish_builder(context, chat)
+
+    if d == "bc_send":
+        bc = ud.get("bc")
+        ud.clear()
+        if bc:
+            asyncio.create_task(run_broadcast(context, chat, bc))
+            await say(context, chat, "🚀 ब्रॉडकास्ट शुरू हो गया है, खत्म होने पर बताऊंगा।")
+        return
+
+    if d == "stats":
+        return await show_stats(context, chat)
+
+    if d == "settings":
+        return await show_settings(context, chat)
+
+    if d.startswith("set_min:"):
+        set_setting("delete_min", d.split(":")[1])
+        return await show_settings(context, chat)
+
+    if d == "toggle_protect":
+        set_setting("protect", "0" if get_setting("protect") == "1" else "1")
+        return await show_settings(context, chat)
+
+    if d == "custom_min":
+        ud.clear()
+        ud["state"] = "custom_min"
+        return await say(context, chat, "✏️ मिनट लिखकर भेजो (1 से 1440 के बीच)।")
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    if not m or not is_admin(m.from_user.id):
+        return
+
+    ud = context.user_data
+    chat = m.chat_id
+    state = ud.get("state")
+    item = extract_item(m)
+
+    if state is None:
+        return await show_menu(context, chat)
+
+    if state == "single" and item:
+        code = create_link("", [], [item])
+        url = await deep_link(context, code)
+        return await say(context, chat, f"🔗 लिंक तैयार:\n{url}")
+
+    if state == "batch" and item:
+        code = create_link(m.caption or "", [], [item])
+        url = await deep_link(context, code)
+        return await say(context, chat, f"🔗 लिंक तैयार:\n{url}")
+
+    if state == "collect":
+        if item:
+            ud["items"].append(item)
+            if m.caption and not ud.get("text"):
+                ud["text"] = m.caption
+            return await say(context, chat,
+                             f"✅ {len(ud['items'])} फाइल जुड़ी। और भेजो, या ➡️ आगे दबाओ।",
+                             builder_kb("collect"))
+        return await say(context, chat, "सिर्फ फोटो/वीडियो/फाइल भेजो, या ➡️ आगे दबाओ।",
+                         builder_kb("collect"))
+
+    if state == "text" and m.text:
+        ud["text"] = m.text
+        ud["state"] = "buttons"
+        return await say(context, chat, BUTTON_HELP, builder_kb("buttons"))
+
+    if state == "buttons" and m.text:
+        rows = parse_buttons(m.text)
+        if not rows:
+            return await say(context, chat, "❌ फॉर्मेट गलत है। ऐसे लिखो:\nलेबल | https://...",
+                             builder_kb("buttons"))
+        ud["buttons"] = rows
+        return await finish_builder(context, chat)
+
+    if state == "custom_min" and m.text and m.text.strip().isdigit():
+        mins = int(m.text.strip())
+        if 1 <= mins <= 1440:
+            set_setting("delete_min", mins)
+            ud.clear()
+            return await show_settings(context, chat)
+        return await say(context, chat, "❌ 1 से 1440 के बीच नंबर भेजो।")
+
+    await say(context, chat, "⚠️ ये इनपुट समझ नहीं आया। सही चीज़ भेजो या ❌ रद्द दबाओ।",
+              KM([[B("❌ रद्द", callback_data="menu")]]))
+
+
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    app.bot_data["username"] = me.username
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    main()
